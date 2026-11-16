@@ -1,7 +1,8 @@
 """FastAPI application for the Acme support workflow.
 
-Exposes webhook ingestion (Zendesk and email), per-user model settings, model
-listing, and a test-ticket runner.
+Exposes webhook ingestion (Zendesk and email), the persisted ticket lifecycle
+(list, detail, approve, resolve, reject, and stats), per-user model settings,
+model listing, and a test-ticket runner.
 """
 
 from __future__ import annotations
@@ -38,12 +39,14 @@ try:
     import llm
     import rag
     import settings as user_settings
+    import ticket_store
     from graph import graph as support_graph
 except ImportError:  # pragma: no cover - package-relative fallback
     from . import integrations
     from . import llm
     from . import rag
     from . import settings as user_settings
+    from . import ticket_store
     from .graph import graph as support_graph
 
 logger = logging.getLogger("acme_support_api")
@@ -64,6 +67,29 @@ class TestTicketIn(BaseModel):
     subject: str
     body: str
     tier: str
+
+
+class ApproveIn(BaseModel):
+    reply: str | None = None          # Optional edited draft; omit to send original
+    ticket_id: str | None = None      # Optional override, e.g. a Zendesk ticket id
+
+
+class RejectIn(BaseModel):
+    reason: str | None = None
+
+
+class ResolveIn(BaseModel):
+    answer: str | None = None         # Optional final answer; falls back to approved draft
+
+
+class TicketApproveIn(BaseModel):
+    reply: str | None = None          # Optional edited draft; omit to approve ai_draft
+    resolved_by: str = "agent"        # Who handled the approval
+
+
+class TicketResolveIn(BaseModel):
+    answer: str                       # Agent-written answer, since no usable draft exists
+    resolved_by: str = "agent"        # Who handled the resolution
 
 
 class SettingsIn(BaseModel):
@@ -390,6 +416,7 @@ def _run_and_report(ticket: str, *, attach_ticket_id: str | None = None) -> dict
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     _migrate()
+    ticket_store.migrate()
     yield
 
 
@@ -443,6 +470,423 @@ def test_ticket(payload: TestTicketIn) -> dict[str, Any]:
     ticket = _compose_ticket(subject=payload.subject, body=payload.body, tier=payload.tier)
     result = _run_and_report(ticket)
     return {"source": "test-ticket", "input": payload.model_dump(), **result}
+
+
+# ---------------------------------------------------------------------------
+# Ticket lifecycle helpers
+# ---------------------------------------------------------------------------
+
+_TICKET_STATUS_FILTERS = {
+    ticket_store.PENDING,
+    ticket_store.RESOLVED,
+    ticket_store.REJECTED,
+    "all",
+}
+
+
+def _require_ticket(ticket_db_id: int) -> dict[str, Any]:
+    """Fetch a ticket row or raise a 404."""
+    row = ticket_store.get_ticket(ticket_db_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"Ticket {ticket_db_id} not found")
+    return row
+
+
+def _ticket_text(row: dict[str, Any]) -> str:
+    """Recompose the original ticket string from the stored ticket columns."""
+    return _compose_ticket(
+        subject=row.get("subject") or "",
+        body=row.get("body") or "",
+        ticket_id=row.get("ticket_id"),
+        tier=row.get("customer_tier") or "",
+    ).strip()
+
+
+def _send_ticket_reply(row: dict[str, Any], reply: str) -> dict[str, Any]:
+    """Reply through Zendesk when an external id exists, else the mock sender."""
+    ticket_id = row.get("ticket_id")
+    if ticket_id:
+        return integrations.zendesk_reply(str(ticket_id), reply)
+    return integrations.post_reply(_ticket_text(row), reply)
+
+
+def _add_resolution_to_kb(row: dict[str, Any], answer: str) -> dict[str, Any]:
+    """Save an agent-written answer into the Chroma knowledge base."""
+    try:
+        return rag.add_resolution(_ticket_text(row), answer)
+    except Exception as exc:
+        logger.exception("Failed to save resolution to Chroma")
+        raise HTTPException(
+            status_code=500, detail=f"Failed to save resolution: {exc}"
+        ) from exc
+
+
+# ---------------------------------------------------------------------------
+# Ticket lifecycle endpoints
+# ---------------------------------------------------------------------------
+
+@app.get("/tickets")
+def list_tickets(
+    status: str = "all",
+    resolution_type: str | None = None,
+) -> list[dict[str, Any]]:
+    """Return tickets newest first, filtered by status and resolution type.
+
+    ``status`` accepts pending, resolved, rejected, or all (the default).
+    """
+    if status not in _TICKET_STATUS_FILTERS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"status must be one of {sorted(_TICKET_STATUS_FILTERS)}",
+        )
+    if (
+        resolution_type is not None
+        and resolution_type not in ticket_store.ALLOWED_RESOLUTION_TYPES
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "resolution_type must be one of "
+                f"{sorted(t for t in ticket_store.ALLOWED_RESOLUTION_TYPES if t)}"
+            ),
+        )
+
+    return ticket_store.list_tickets(
+        status=None if status == "all" else status,
+        resolution_type=resolution_type,
+    )
+
+
+@app.get("/tickets/{ticket_db_id}")
+def get_ticket(ticket_db_id: int) -> dict[str, Any]:
+    """Return the full stored record for one ticket."""
+    return _require_ticket(ticket_db_id)
+
+
+@app.post("/tickets/{ticket_db_id}/approve")
+def approve_ticket(
+    ticket_db_id: int,
+    payload: TicketApproveIn = TicketApproveIn(),
+) -> dict[str, Any]:
+    """Send the AI draft or an edited reply, then mark the ticket resolved.
+
+    A reply identical to ``ai_draft`` is recorded as ``manual_approved``;
+    anything else is recorded as ``manual_edited`` and saved to the knowledge
+    base.
+    """
+    row = _require_ticket(ticket_db_id)
+    if row["status"] != ticket_store.PENDING:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Ticket {ticket_db_id} cannot be approved (status: {row['status']})",
+        )
+
+    draft = (row.get("ai_draft") or "").strip()
+    reply = (payload.reply if payload.reply is not None else draft).strip()
+    if not reply:
+        raise HTTPException(
+            status_code=400,
+            detail="No reply available to send; provide a reply or approve a ticket with an AI draft",
+        )
+
+    resolution_type = (
+        ticket_store.MANUAL_APPROVED if reply == draft else ticket_store.MANUAL_EDITED
+    )
+
+    send_result = _send_ticket_reply(row, reply)
+    if not send_result.get("ok"):
+        raise HTTPException(
+            status_code=502,
+            detail={"message": "Failed to send approved reply", "send_result": send_result},
+        )
+
+    saved = None
+    if resolution_type == ticket_store.MANUAL_EDITED:
+        saved = _add_resolution_to_kb(row, reply)
+
+    resolved_at = _now()
+    ticket_store.update_ticket(
+        ticket_db_id,
+        status=ticket_store.RESOLVED,
+        resolution_type=resolution_type,
+        final_answer=reply,
+        resolved_by=payload.resolved_by,
+        resolved_at=resolved_at,
+    )
+
+    return {
+        "id": ticket_db_id,
+        "status": ticket_store.RESOLVED,
+        "resolution_type": resolution_type,
+        "final_answer": reply,
+        "resolved_by": payload.resolved_by,
+        "resolved_at": resolved_at,
+        "send_result": send_result,
+        "saved": saved,
+    }
+
+
+@app.post("/tickets/{ticket_db_id}/resolve")
+def resolve_ticket(
+    ticket_db_id: int,
+    payload: TicketResolveIn,
+) -> dict[str, Any]:
+    """Resolve a ticket with an agent-written answer and save it to the KB."""
+    row = _require_ticket(ticket_db_id)
+    if row["status"] == ticket_store.RESOLVED:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Ticket {ticket_db_id} is already resolved",
+        )
+    if row["status"] == ticket_store.REJECTED:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Ticket {ticket_db_id} was rejected and cannot be resolved",
+        )
+
+    answer = (payload.answer or "").strip()
+    if not answer:
+        raise HTTPException(
+            status_code=400, detail="An answer is required to resolve a ticket"
+        )
+
+    saved = _add_resolution_to_kb(row, answer)
+
+    resolved_at = _now()
+    ticket_store.update_ticket(
+        ticket_db_id,
+        status=ticket_store.RESOLVED,
+        resolution_type=ticket_store.MANUAL_WRITTEN,
+        final_answer=answer,
+        resolved_by=payload.resolved_by,
+        resolved_at=resolved_at,
+    )
+
+    return {
+        "id": ticket_db_id,
+        "status": ticket_store.RESOLVED,
+        "resolution_type": ticket_store.MANUAL_WRITTEN,
+        "final_answer": answer,
+        "resolved_by": payload.resolved_by,
+        "resolved_at": resolved_at,
+        "saved": saved,
+    }
+
+
+@app.post("/tickets/{ticket_db_id}/reject")
+def reject_ticket(ticket_db_id: int, payload: RejectIn = RejectIn()) -> dict[str, Any]:
+    """Reject a pending ticket without sending a reply."""
+    row = _require_ticket(ticket_db_id)
+    if row["status"] != ticket_store.PENDING:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Ticket {ticket_db_id} cannot be rejected (status: {row['status']})",
+        )
+
+    resolved_at = _now()
+    ticket_store.update_ticket(
+        ticket_db_id,
+        status=ticket_store.REJECTED,
+        resolved_at=resolved_at,
+    )
+
+    return {
+        "id": ticket_db_id,
+        "status": ticket_store.REJECTED,
+        "resolved_at": resolved_at,
+        "reason": payload.reason,
+    }
+
+
+@app.get("/stats")
+def get_ticket_stats() -> dict[str, Any]:
+    """Return lifecycle counts plus the share of tickets resolved automatically."""
+    rows = ticket_store.list_tickets()
+    total = len(rows)
+    auto_resolved = sum(
+        1
+        for row in rows
+        if row["status"] == ticket_store.RESOLVED
+        and row["resolution_type"] == ticket_store.AUTO
+    )
+    manual_resolved = sum(
+        1
+        for row in rows
+        if row["status"] == ticket_store.RESOLVED
+        and row["resolution_type"] in ticket_store.MANUAL_RESOLUTION_TYPES
+    )
+
+    return {
+        "total": total,
+        "pending": sum(1 for row in rows if row["status"] == ticket_store.PENDING),
+        "auto_resolved": auto_resolved,
+        "manual_resolved": manual_resolved,
+        "rejected": sum(1 for row in rows if row["status"] == ticket_store.REJECTED),
+        "auto_resolution_rate": round(auto_resolved / total, 4) if total else 0.0,
+    }
+
+
+@app.get("/escalations")
+def list_escalations() -> list[dict[str, Any]]:
+    """Alias for ``GET /tickets?status=pending`` -- the human review queue."""
+    return ticket_store.list_tickets(status=ticket_store.PENDING)
+
+
+@app.get("/escalations/{escalation_id}")
+def get_escalation(escalation_id: int) -> dict[str, Any]:
+    """Return a single escalation enriched with parsed subject/body and sources."""
+    conn = _connect()
+    try:
+        row = _get_escalation_row(conn, escalation_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail=f"Escalation {escalation_id} not found")
+
+        data = _row_to_dict(row)
+        subject, body = _split_ticket(data.get("ticket") or "")
+        data["subject"] = subject
+        data["body"] = body
+        data["sources"] = _retrieve_sources(data.get("ticket") or "")
+        return data
+    finally:
+        conn.close()
+
+
+@app.post("/escalations/{escalation_id}/approve")
+def approve_escalation(escalation_id: int, payload: ApproveIn = ApproveIn()) -> dict[str, Any]:
+    """Send the edited or original draft, then mark the escalation approved."""
+    conn = _connect()
+    try:
+        row = _get_escalation_row(conn, escalation_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail=f"Escalation {escalation_id} not found")
+
+        current_status = row["status"]
+        if current_status != "pending":
+            raise HTTPException(
+                status_code=409,
+                detail=f"Escalation {escalation_id} cannot be approved (status: {current_status})",
+            )
+
+        reply = (payload.reply or row["reply_attempt"] or "").strip()
+        ticket_id = payload.ticket_id or row["ticket_id"]
+
+        if ticket_id:
+            send_result = integrations.zendesk_reply(str(ticket_id), reply)
+        else:
+            send_result = integrations.post_reply(row["ticket"] or "", reply)
+
+        if not send_result.get("ok"):
+            raise HTTPException(
+                status_code=502,
+                detail={"message": "Failed to send approved reply", "send_result": send_result},
+            )
+
+        conn.execute(
+            """
+            UPDATE escalations
+            SET status = 'approved',
+                final_reply = ?,
+                approved_at = ?,
+                ticket_id = COALESCE(ticket_id, ?)
+            WHERE id = ?
+            """,
+            (reply, _now(), str(ticket_id) if ticket_id else None, escalation_id),
+        )
+        conn.commit()
+
+        return {
+            "id": escalation_id,
+            "status": "approved",
+            "reply": reply,
+            "send_result": send_result,
+        }
+    finally:
+        conn.close()
+
+
+@app.post("/escalations/{escalation_id}/reject")
+def reject_escalation(escalation_id: int, payload: RejectIn = RejectIn()) -> dict[str, Any]:
+    """Reject an escalation without sending the draft."""
+    conn = _connect()
+    try:
+        row = _get_escalation_row(conn, escalation_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail=f"Escalation {escalation_id} not found")
+
+        current_status = row["status"]
+        if current_status != "pending":
+            raise HTTPException(
+                status_code=409,
+                detail=f"Escalation {escalation_id} cannot be rejected (status: {current_status})",
+            )
+
+        conn.execute(
+            "UPDATE escalations SET status = 'rejected' WHERE id = ?",
+            (escalation_id,),
+        )
+        conn.commit()
+
+        return {"id": escalation_id, "status": "rejected", "reason": payload.reason}
+    finally:
+        conn.close()
+
+
+@app.post("/escalations/{escalation_id}/resolve")
+def resolve_escalation(escalation_id: int, payload: ResolveIn = ResolveIn()) -> dict[str, Any]:
+    """Save the final answer into the RAG knowledge base."""
+    conn = _connect()
+    try:
+        row = _get_escalation_row(conn, escalation_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail=f"Escalation {escalation_id} not found")
+
+        current_status = row["status"]
+        if current_status == "resolved":
+            raise HTTPException(
+                status_code=409,
+                detail=f"Escalation {escalation_id} is already resolved",
+            )
+        if current_status == "rejected":
+            raise HTTPException(
+                status_code=409,
+                detail=f"Escalation {escalation_id} was rejected and cannot be resolved",
+            )
+
+        answer = (payload.answer or row["final_reply"] or row["reply_attempt"] or "").strip()
+        if not answer:
+            raise HTTPException(
+                status_code=400,
+                detail="No answer available to save; provide an answer or approve the draft first",
+            )
+
+        try:
+            saved = rag.add_resolution(row["ticket"] or "", answer)
+        except Exception as exc:
+            logger.exception("Failed to save resolution to Chroma")
+            raise HTTPException(
+                status_code=500, detail=f"Failed to save resolution: {exc}"
+            ) from exc
+
+        conn.execute(
+            """
+            UPDATE escalations
+            SET status = 'resolved',
+                resolved_answer = ?,
+                resolved_at = ?
+            WHERE id = ?
+            """,
+            (answer, _now(), escalation_id),
+        )
+        conn.commit()
+
+        return {
+            "id": escalation_id,
+            "status": "resolved",
+            "answer": answer,
+            "saved": saved,
+        }
+    finally:
+        conn.close()
 
 
 @app.get("/models")
