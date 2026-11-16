@@ -1,0 +1,54 @@
+# ---------------------------------------------------------------------------
+# Python
+# ---------------------------------------------------------------------------
+venv/
+.venv/
+env/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ---------------------------------------------------------------------------
+# Node / Vite
+# ---------------------------------------------------------------------------
+node_modules/
+dist/
+.vite/
+npm-debug.log*
+yarn-error.log*
+
+# ---------------------------------------------------------------------------
+# Secrets and machine-local config (.env.example is a placeholder template)
+# ---------------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+
+# ---------------------------------------------------------------------------
+# Runtime state: Chroma index, SQLite databases, user preferences
+# ---------------------------------------------------------------------------
+chroma_db/
+*.db
+*.sqlite
+*.sqlite3
+*.sqlite3-journal
+*.sqlite3-wal
+*.sqlite3-shm
+settings.json
+
+# ---------------------------------------------------------------------------
+# Knowledge-base files produced at runtime.
+# `rag.add_resolution` writes resolved-ticket-YYYYMMDD-HHMMSS.md into
+# backend/data/kb/ (the two resolved-ticket-10xx files there are seed docs and
+# stay tracked), and uploads have no separate storage directory.
+# ---------------------------------------------------------------------------
+backend/data/kb/resolved-ticket-????????-??????.md
+backend/data/uploads/
+
+# ---------------------------------------------------------------------------
+# OS noise
+# ---------------------------------------------------------------------------
+.DS_Store
