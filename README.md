@@ -11,83 +11,13 @@ A React dashboard provides the review queue, ticket history, live statistics, a
 model selector and a knowledge-base manager for PDF/CSV/DOCX/Markdown uploads
 and typed text.
 
-## Architecture
-
-```mermaid
-flowchart TD
-    T["Inbound ticket<br/>Zendesk webhook · email webhook · /test-ticket"]
-    C["classify<br/>urgency · department · complexity · sentiment · entities"]
-    R["retrieve<br/>ChromaDB similarity search"]
-    D["draft_resolution<br/>RAG-grounded reply + can_resolve flag"]
-    S["score_confidence<br/>grounded / complete / tone / risk → confidence"]
-    RT{"route<br/>confidence ≥ threshold<br/>and simple, non-critical,<br/>resolvable?"}
-    A["auto_reply<br/>send reply · status = resolved"]
-    E["escalate<br/>handoff note · Slack alert · status = pending"]
-    TS[("tickets.sqlite3<br/>history + resolution type")]
-    CH[("chroma_db<br/>vector store")]
-    KB["Knowledge base<br/>uploads + typed text"]
-
-    T --> C --> R --> D --> S --> RT
-    RT -->|yes| A
-    RT -->|no| E
-    A --> TS
-    E --> TS
-    A --> OUT["Zendesk reply / mock sender"]
-    E --> SL["#support-escalations"]
-    CH -.-> R
-    KB -. ingest .-> CH
-```
-
-The FastAPI app also owns the review surface: `GET /tickets`,
-`POST /tickets/{id}/{approve,resolve,reject}`, `GET /stats`, the legacy
-`/escalations` aliases, and the `/kb/*` management endpoints. The React bundle
-is served by nginx, which proxies `/api/*` to the backend and strips the prefix;
-the Vite dev server mirrors that proxy so the same relative URLs work locally.
-
-## Tech stack
-
-| Layer | Technology |
-| --- | --- |
-| API | Python 3.11, FastAPI, Uvicorn, Pydantic |
-| Workflow | LangGraph (StateGraph), LangChain core |
-| LLM providers | Ollama (`llama3.1:8b` by default), OpenAI fallback (`gpt-4o-mini`) |
-| Retrieval | ChromaDB + Ollama embeddings (`nomic-embed-text`), `RecursiveCharacterTextSplitter` (800/100) |
-| Persistence | SQLite (`tickets`, `escalations`, `kb`), JSON settings file, Chroma on disk |
-| Document parsing | `pypdf`, `python-docx`, CSV reader, plain text/Markdown |
-| Integrations | Zendesk REST, Slack SDK, IMAP email polling, `DRY_RUN` mode |
-| Frontend | React 18, Vite 5, hand-written CSS |
-| Delivery | Docker multi-stage builds, nginx, Docker Compose with named volumes |
-
-## Repository layout
-
-```
-backend/
-  main.py            FastAPI app: webhooks, tickets, escalations, KB, models, settings
-  graph.py           LangGraph nodes, routing, confidence gate, ticket persistence
-  prompts.py         Prompt templates + Pydantic schemas (Classification, Resolution, Score)
-  llm.py             Provider/model registry with fallback chain
-  rag.py             Chroma ingestion, retrieval, resolution write-back
-  loaders.py         PDF/CSV/DOCX/text extraction (10 MB per file)
-  kb_store.py        SQLite catalogue of KB documents (hash, chunks, uploader)
-  ticket_store.py    SQLite ticket history and lifecycle
-  settings.py        Per-user provider/model preference (settings.json)
-  integrations.py    Zendesk, Slack and IMAP helpers
-  data/kb/           Seed knowledge-base documents
-frontend/
-  src/App.jsx            Ticket dashboard (tabs, stats, model selector, test form)
-  src/KnowledgeBase.jsx  KB management page
-  src/api.js             `API_BASE` helper (`/api` by default)
-  vite.config.js         Dev server + `/api` proxy
-  nginx.conf             Static hosting + `/api` proxy for the container image
-docker-compose.yml   backend + frontend services and named volumes
-```
+See [ARCHITECTURE.md](ARCHITECTURE.md) for the workflow diagram.
 
 ## Screenshots
 
 ![ICSTRR dashboard](docs/screenshots/dashboard.png)
+![ICSTRR knowledge base management](docs/screenshots/knowledgebase.png)
 
-> _Placeholder: capture the running dashboard (ticket queue, detail panel and
-> stats bar) and save it as `docs/screenshots/dashboard.png`._
 
 ## Quick start with Docker
 
@@ -119,14 +49,6 @@ ollama pull nomic-embed-text
 3. Open the dashboard at <http://localhost:5173> and the API docs at
    <http://localhost:8000/docs>.
 
-4. Smoke test:
-
-   ```bash
-   curl -s http://localhost:8000/models | head
-   curl -s -X POST http://localhost:8000/test-ticket \
-     -H 'Content-Type: application/json' \
-     -d '{"subject":"Refund request","body":"I was charged twice","tier":"priority"}'
-   ```
 
 The `backend_data` volume starts empty and shadows the seed documents baked
 into the image, so load the knowledge base once after the first start:
@@ -165,38 +87,11 @@ so no code change is needed between local and containerised runs.
 Copy `.env.example` to `.env`; only a reachable Ollama (or an OpenAI key) is
 required.
 
-| Variable | Default | Purpose |
-| --- | --- | --- |
-| `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama endpoint; use `http://host.docker.internal:11434` in Docker |
-| `OPENAI_API_KEY` | – | Enables the OpenAI fallback provider |
-| `DEFAULT_PROVIDER` | `ollama` | Primary provider |
-| `DEFAULT_MODEL` | `llama3.1:8b` | Primary chat model |
-| `FALLBACK_PROVIDER` | `openai` | Provider used when the primary fails |
-| `FALLBACK_MODEL` | `gpt-4o-mini` | Fallback chat model |
-| `FALLBACK_ENABLED` | `true` | Toggle the fallback chain |
-| `EMBED_MODEL` | `nomic-embed-text` | Ollama embedding model |
-| `CONFIDENCE_THRESHOLD` | `0.7` (code default; `.env.example` ships `0.75`) | Minimum confidence for auto-reply |
-| `DRY_RUN` | `false` | Log outbound replies instead of sending them |
-| `ZENDESK_SUBDOMAIN` | – | Zendesk subdomain for replies |
-| `ZENDESK_EMAIL` | – | Zendesk API user |
-| `ZENDESK_TOKEN` | – | Zendesk API token |
-| `ZENDESK_TIMEOUT` | `30` | Zendesk request timeout (seconds) |
-| `SLACK_BOT_TOKEN` | – | Slack bot token for escalation alerts |
-| `SLACK_CHANNEL` | `#support-escalations` | Slack destination channel |
-| `IMAP_HOST` | `imap.gmail.com` | Mailbox host for email polling |
-| `IMAP_PORT` | `993` | Mailbox port |
-| `IMAP_USER` | – | Mailbox user |
-| `IMAP_PASSWORD` | – | Mailbox password / app password |
-| `IMAP_MAILBOX` | `INBOX` | Mailbox folder |
-| `ESCALATIONS_DB_PATH` | `backend/escalations.sqlite3` | Escalation review database |
-| `TICKETS_DB_PATH` | `backend/tickets.sqlite3` | Ticket history database |
-| `KB_DB_PATH` | `backend/kb.sqlite3` | KB document catalogue |
-| `SETTINGS_PATH` | `backend/settings.json` | Per-user model preferences |
-| `KB_DIR` | `backend/data/kb` | Knowledge-base directory |
-| `CHROMA_DIR` | `backend/chroma_db` | Chroma persistence directory |
 
 The `*_PATH`, `KB_DIR` and `CHROMA_DIR` overrides are what `docker-compose.yml`
 uses to push every mutable file into the `backend_data` / `chroma_db` volumes.
+
+
 
 ## Ticket flow and confidence scoring
 
@@ -252,6 +147,53 @@ request through nginx), duplicates rejected by SHA-256 hash, re-indexing replace
 the previous chunks, and deleting a document removes its vectors. Resolution
 write-back (`rag.add_resolution`) also stores
 `resolved-ticket-YYYYMMDD-HHMMSS.md` files under the KB directory.
+
+
+The FastAPI app also owns the review surface: `GET /tickets`,
+`POST /tickets/{id}/{approve,resolve,reject}`, `GET /stats`, the legacy
+`/escalations` aliases, and the `/kb/*` management endpoints. The React bundle
+is served by nginx, which proxies `/api/*` to the backend and strips the prefix;
+the Vite dev server mirrors that proxy so the same relative URLs work locally.
+
+## Tech stack
+
+| Layer | Technology |
+| --- | --- |
+| API | Python 3.11, FastAPI, Uvicorn, Pydantic |
+| Workflow | LangGraph (StateGraph), LangChain core |
+| LLM providers | Ollama (`llama3.1:8b` by default), OpenAI fallback (`gpt-4o-mini`) |
+| Retrieval | ChromaDB + Ollama embeddings (`nomic-embed-text`), `RecursiveCharacterTextSplitter` (800/100) |
+| Persistence | SQLite (`tickets`, `escalations`, `kb`), JSON settings file, Chroma on disk |
+| Document parsing | `pypdf`, `python-docx`, CSV reader, plain text/Markdown |
+| Integrations | Zendesk REST, Slack SDK, IMAP email polling, `DRY_RUN` mode |
+| Frontend | React 18, Vite 5, hand-written CSS |
+| Delivery | Docker multi-stage builds, nginx, Docker Compose with named volumes |
+
+## Repository layout
+
+```
+backend/
+  main.py            FastAPI app: webhooks, tickets, escalations, KB, models, settings
+  graph.py           LangGraph nodes, routing, confidence gate, ticket persistence
+  prompts.py         Prompt templates + Pydantic schemas (Classification, Resolution, Score)
+  llm.py             Provider/model registry with fallback chain
+  rag.py             Chroma ingestion, retrieval, resolution write-back
+  loaders.py         PDF/CSV/DOCX/text extraction (10 MB per file)
+  kb_store.py        SQLite catalogue of KB documents (hash, chunks, uploader)
+  ticket_store.py    SQLite ticket history and lifecycle
+  settings.py        Per-user provider/model preference (settings.json)
+  integrations.py    Zendesk, Slack and IMAP helpers
+  data/kb/           Seed knowledge-base documents
+frontend/
+  src/App.jsx            Ticket dashboard (tabs, stats, model selector, test form)
+  src/KnowledgeBase.jsx  KB management page
+  src/api.js             `API_BASE` helper (`/api` by default)
+  vite.config.js         Dev server + `/api` proxy
+  nginx.conf             Static hosting + `/api` proxy for the container image
+docker-compose.yml   backend + frontend services and named volumes
+```
+
+
 
 ## Data and persistence
 
