@@ -1,0 +1,38 @@
+services:
+  backend:
+    build: ./backend
+    env_file: .env
+    environment:
+      # Keep every mutable file inside the two named volumes below so state
+      # survives `docker compose down` / image rebuilds.
+      ESCALATIONS_DB_PATH: /app/data/escalations.sqlite3
+      TICKETS_DB_PATH: /app/data/tickets.sqlite3
+      KB_DB_PATH: /app/data/kb.sqlite3
+      SETTINGS_PATH: /app/data/settings.json
+      KB_DIR: /app/data/kb
+      CHROMA_DIR: /app/chroma_db
+    ports:
+      - "8000:8000"
+    volumes:
+      - chroma_db:/app/chroma_db
+      - backend_data:/app/data
+    extra_hosts:
+      # Lets the container reach an Ollama instance running on the host.
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+
+  frontend:
+    build: ./frontend
+    ports:
+      # nginx listens on 80 inside the container; published on the same host
+      # port the Vite dev server uses.
+      - "5173:80"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+volumes:
+  # Chroma vector store.
+  chroma_db:
+  # SQLite databases, settings.json and uploaded knowledge-base files.
+  backend_data:

@@ -1,0 +1,13 @@
+# Build context hygiene: only sources and lockfiles belong in the image build.
+node_modules/
+dist/
+.vite/
+
+.env
+.env.*
+
+.git/
+.gitignore
+npm-debug.log*
+yarn-error.log*
+.DS_Store

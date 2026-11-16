@@ -1,0 +1,26 @@
+# Build context hygiene: keep the image small and free of local state/secrets.
+venv/
+.venv/
+env/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+.env
+.env.*
+
+# Runtime data: Chroma index and SQLite/settings state live in Docker volumes.
+chroma_db/
+settings.json
+*.db
+*.sqlite3
+*.sqlite3-journal
+*.sqlite3-wal
+*.sqlite3-shm
+
+.git/
+.gitignore
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.DS_Store

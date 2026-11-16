@@ -14,5 +14,15 @@ export default defineConfig({
       host: '127.0.0.1',
       port: 5173,
     },
+    // Mirror the nginx proxy so `npm run dev` and the containerised build both
+    // use the same relative /api URLs. The rewrite strips the prefix, matching
+    // `proxy_pass http://backend:8000/;` in frontend/nginx.conf.
+    proxy: {
+      '/api': {
+        target: 'http://127.0.0.1:8000',
+        changeOrigin: true,
+        rewrite: (path) => path.replace(/^\/api/, ''),
+      },
+    },
   },
 })
