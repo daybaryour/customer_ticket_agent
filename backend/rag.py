@@ -72,6 +72,13 @@ def _reset_collection() -> None:
         client.delete_collection(COLLECTION_NAME)
 
 
+def _get_collection():
+    """Return the raw Chroma collection, creating it if it does not exist."""
+    client = chromadb.PersistentClient(path=str(CHROMA_DIR))
+    return client.get_or_create_collection(COLLECTION_NAME)
+
+
+
 def ingest() -> int:
     """Split all KB documents, embed them, and store them in Chroma."""
     documents = _load_documents()
@@ -95,6 +102,89 @@ def ingest() -> int:
         f"into {CHROMA_DIR} (collection: {COLLECTION_NAME})."
     )
     return len(chunks)
+
+
+def add_document(
+    doc_id: str,
+    title: str,
+    items: list[tuple[str, dict]],
+    source_type: str | None = None,
+) -> int:
+    """Split ``items`` into chunks, embed them, and store them in Chroma.
+
+    Args:
+        doc_id: Stable id stored in every chunk's metadata (``doc_id``).
+        title: Human-readable document title; also the retrieval source name.
+        items: ``(text, metadata)`` tuples from :mod:`loaders`. Metadata may
+            contain ``page`` (PDF) or ``csv_qa`` (keep the row as one chunk).
+        source_type: One of pdf/csv/docx/txt/md/typed. Falls back to each
+            item's ``source_type`` metadata and finally to ``"txt"``.
+
+    Returns:
+        The number of chunks written to Chroma.
+
+    Raises:
+        ValueError: If none of the items contain indexable text.
+    """
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=CHUNK_SIZE,
+        chunk_overlap=CHUNK_OVERLAP,
+    )
+
+    chunks: list[Document] = []
+    for text, metadata in items:
+        clean = (text or "").strip()
+        if not clean:
+            continue
+
+        meta = dict(metadata or {})
+        item_source_type = source_type or meta.get("source_type") or "txt"
+        base_metadata: dict = {
+            "doc_id": str(doc_id),
+            "title": title,
+            "source": title,
+            "source_type": item_source_type,
+        }
+        if meta.get("page") is not None:
+            base_metadata["page"] = int(meta["page"])
+        if meta.get("row") is not None:
+            base_metadata["row"] = int(meta["row"])
+
+        if meta.get("csv_qa"):
+            # One CSV question/answer row must stay a single chunk.
+            chunks.append(Document(page_content=clean, metadata=base_metadata))
+        else:
+            chunks.extend(
+                splitter.create_documents([clean], metadatas=[base_metadata])
+            )
+
+    if not chunks:
+        raise ValueError("No indexable text was found in this document.")
+
+    embeddings = _get_embeddings()
+    vectorstore = _get_chroma(embeddings)
+    try:
+        vectorstore.add_documents(chunks)
+    except Exception:
+        # Do not leave a half-indexed document behind if embedding fails.
+        delete_document(str(doc_id))
+        raise
+
+    return len(chunks)
+
+
+def delete_document(doc_id: str) -> int:
+    """Remove every chunk tagged with ``doc_id`` from Chroma.
+
+    Returns:
+        The number of chunks that were deleted.
+    """
+    collection = _get_collection()
+    existing = collection.get(where={"doc_id": str(doc_id)}, include=[])
+    ids = existing.get("ids") or []
+    if ids:
+        collection.delete(ids=ids)
+    return len(ids)
 
 
 def retrieve(query: str, k: int = DEFAULT_K) -> list[dict]:

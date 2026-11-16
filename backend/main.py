@@ -7,6 +7,7 @@ model listing, and a test-ticket runner.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -15,9 +16,11 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from dotenv import load_dotenv
-from fastapi import Body, FastAPI, HTTPException
+from fastapi import Body, FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -36,14 +39,18 @@ load_dotenv(BASE_DIR / ".env")
 # the relative fallback keeps the package import happy too.
 try:
     import integrations
+    import kb_store
     import llm
+    import loaders
     import rag
     import settings as user_settings
     import ticket_store
     from graph import graph as support_graph
 except ImportError:  # pragma: no cover - package-relative fallback
     from . import integrations
+    from . import kb_store
     from . import llm
+    from . import loaders
     from . import rag
     from . import settings as user_settings
     from . import ticket_store
@@ -95,6 +102,17 @@ class TicketResolveIn(BaseModel):
 class SettingsIn(BaseModel):
     provider: str
     model: str
+
+
+class KbTextIn(BaseModel):
+    title: str
+    content: str
+    uploaded_by: str = "agent"
+
+
+class KbSearchIn(BaseModel):
+    query: str
+    k: int = 4
 
 
 # ---------------------------------------------------------------------------
@@ -417,6 +435,7 @@ def _run_and_report(ticket: str, *, attach_ticket_id: str | None = None) -> dict
 async def lifespan(_: FastAPI):
     _migrate()
     ticket_store.migrate()
+    kb_store.migrate()
     yield
 
 
@@ -887,6 +906,441 @@ def resolve_escalation(escalation_id: int, payload: ResolveIn = ResolveIn()) -> 
         }
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Knowledge-base management
+# ---------------------------------------------------------------------------
+
+KB_PREVIEW_CHARS = 1200
+
+
+def _sha256_hex(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _kb_preview(items: list[tuple[str, dict]]) -> str:
+    """Build a short text preview from extracted items."""
+    text = "\n\n".join(
+        chunk.strip() for chunk, _ in items if chunk and chunk.strip()
+    )
+    return text[:KB_PREVIEW_CHARS]
+
+
+def _kb_source_type(filename: str) -> str:
+    """Return a valid source_type even when the extension is unsupported."""
+    try:
+        return loaders.source_type_for(filename)
+    except ValueError:
+        return "txt"
+
+
+def _ingest_kb_file(
+    file_bytes: bytes, filename: str, uploaded_by: str
+) -> dict[str, Any]:
+    """Extract, index, and record one uploaded file.
+
+    Failures are captured in a ``failed`` kb_documents row and returned in the
+    result dictionary; they never raise so the other files in a multi-file
+    upload still succeed.
+    """
+    digest = _sha256_hex(file_bytes)
+    duplicate = kb_store.find_by_hash(digest)
+    if duplicate is not None:
+        return {
+            "filename": filename,
+            "status": "duplicate",
+            "message": (
+                f"'{filename}' already exists as '{duplicate['title']}'."
+            ),
+            "document": duplicate,
+        }
+
+    title = Path(filename).stem.strip() or filename
+    source_type = _kb_source_type(filename)
+    chroma_doc_id = uuid4().hex
+    items: list[tuple[str, dict]] = []
+
+    try:
+        items = loaders.extract_text(file_bytes, filename)
+        chunk_count = rag.add_document(
+            chroma_doc_id, title, items, source_type=source_type
+        )
+    except Exception as exc:
+        logger.warning("Failed to index %s: %s", filename, exc)
+        record = kb_store.create_document(
+            title=title,
+            source_type=source_type,
+            chroma_doc_id=chroma_doc_id,
+            original_filename=filename,
+            chunk_count=0,
+            status=kb_store.FAILED,
+            error=str(exc),
+            uploaded_by=uploaded_by,
+            content_hash=digest,
+            preview=_kb_preview(items),
+        )
+        return {
+            "filename": filename,
+            "status": "failed",
+            "error": str(exc),
+            "document": record,
+        }
+
+    record = kb_store.create_document(
+        title=title,
+        source_type=source_type,
+        chroma_doc_id=chroma_doc_id,
+        original_filename=filename,
+        chunk_count=chunk_count,
+        status=kb_store.INDEXED,
+        uploaded_by=uploaded_by,
+        content_hash=digest,
+        preview=_kb_preview(items),
+    )
+    return {
+        "filename": filename,
+        "status": "indexed",
+        "chunk_count": chunk_count,
+        "document": record,
+    }
+
+
+@app.post("/kb/upload")
+async def upload_kb_files(
+    files: list[UploadFile] = File(...),
+    uploaded_by: str = Form("agent"),
+) -> dict[str, Any]:
+    """Upload one or more files and index each one independently."""
+    if not files:
+        raise HTTPException(status_code=400, detail="No files were provided")
+
+    results: list[dict[str, Any]] = []
+    for upload in files:
+        filename = upload.filename or "upload"
+        file_bytes = await upload.read()
+        results.append(
+            await run_in_threadpool(
+                _ingest_kb_file, file_bytes, filename, uploaded_by
+            )
+        )
+    return {"results": results}
+
+
+@app.post("/kb/text")
+def add_kb_text(payload: KbTextIn) -> dict[str, Any]:
+    """Index typed text as a ``typed`` knowledge-base document."""
+    title = payload.title.strip()
+    content = payload.content.strip()
+
+    if not title:
+        raise HTTPException(status_code=400, detail="A title is required")
+    if not content:
+        raise HTTPException(status_code=400, detail="Content must not be empty")
+
+    digest = _sha256_hex(content.encode("utf-8"))
+    duplicate = kb_store.find_by_hash(digest)
+    if duplicate is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "A document with this content already exists: "
+                f"'{duplicate['title']}'"
+            ),
+        )
+
+    chroma_doc_id = uuid4().hex
+    try:
+        chunk_count = rag.add_document(
+            chroma_doc_id, title, [(content, {})], source_type="typed"
+        )
+    except Exception as exc:
+        logger.exception("Failed to index typed document %r", title)
+        kb_store.create_document(
+            title=title,
+            source_type="typed",
+            chroma_doc_id=chroma_doc_id,
+            chunk_count=0,
+            status=kb_store.FAILED,
+            error=str(exc),
+            uploaded_by=payload.uploaded_by,
+            content_hash=digest,
+            content=content,
+            preview=content[:KB_PREVIEW_CHARS],
+        )
+        raise HTTPException(
+            status_code=500, detail=f"Failed to index document: {exc}"
+        ) from exc
+
+    return kb_store.create_document(
+        title=title,
+        source_type="typed",
+        chroma_doc_id=chroma_doc_id,
+        chunk_count=chunk_count,
+        status=kb_store.INDEXED,
+        uploaded_by=payload.uploaded_by,
+        content_hash=digest,
+        content=content,
+        preview=content[:KB_PREVIEW_CHARS],
+    )
+
+
+
+@app.get("/kb")
+def list_kb_documents() -> list[dict[str, Any]]:
+    """List knowledge-base documents newest first, with chunk counts."""
+    return kb_store.list_documents()
+
+
+@app.get("/kb/{doc_id}")
+def get_kb_document(doc_id: int) -> dict[str, Any]:
+    """Return a document's metadata plus a text preview."""
+    record = kb_store.get_document(doc_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail=f"Document {doc_id} not found")
+
+    data = dict(record)
+    if not data.get("preview"):
+        data["preview"] = (data.get("content") or "")[:KB_PREVIEW_CHARS]
+
+    # Only typed documents keep their editable source text.
+    if data.get("source_type") != "typed":
+        data.pop("content", None)
+    return data
+
+
+def _kb_reindex_file(
+    record: dict[str, Any],
+    file_bytes: bytes,
+    filename: str,
+    title: str | None,
+    uploaded_by: str,
+) -> dict[str, Any]:
+    """Replace a document's chunks with a newly uploaded file."""
+    digest = _sha256_hex(file_bytes)
+    duplicate = kb_store.find_by_hash(digest)
+    if duplicate is not None and duplicate["id"] != record["id"]:
+        raise HTTPException(
+            status_code=409,
+            detail=f"That file already exists as '{duplicate['title']}'",
+        )
+
+    try:
+        items = loaders.extract_text(file_bytes, filename)
+        source_type = loaders.source_type_for(filename)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    rag.delete_document(record.get("chroma_doc_id") or str(record["id"]))
+    chroma_doc_id = record.get("chroma_doc_id") or uuid4().hex
+    new_title = (title or record["title"]).strip() or record["title"]
+
+    try:
+        chunk_count = rag.add_document(
+            chroma_doc_id, new_title, items, source_type=source_type
+        )
+    except Exception as exc:
+        logger.exception("Failed to replace file for document %s", record["id"])
+        kb_store.update_document(
+            record["id"],
+            chunk_count=0,
+            status=kb_store.FAILED,
+            error=str(exc),
+            chroma_doc_id=chroma_doc_id,
+        )
+        raise HTTPException(
+            status_code=500, detail=f"Failed to index the replacement: {exc}"
+        ) from exc
+
+    return {
+        "title": new_title,
+        "source_type": source_type,
+        "original_filename": filename,
+        "chunk_count": chunk_count,
+        "status": kb_store.INDEXED,
+        "error": None,
+        "uploaded_by": uploaded_by,
+        "chroma_doc_id": chroma_doc_id,
+        "content_hash": digest,
+        "content": None,
+        "preview": _kb_preview(items),
+    }
+
+
+def _kb_reindex_text(
+    record: dict[str, Any],
+    content: str,
+    title: str | None,
+    uploaded_by: str,
+) -> dict[str, Any]:
+    """Replace a document's chunks with new typed content."""
+    digest = _sha256_hex(content.encode("utf-8"))
+    duplicate = kb_store.find_by_hash(digest)
+    if duplicate is not None and duplicate["id"] != record["id"]:
+        raise HTTPException(
+            status_code=409,
+            detail=f"A document with this content already exists: '{duplicate['title']}'",
+        )
+
+    rag.delete_document(record.get("chroma_doc_id") or str(record["id"]))
+    chroma_doc_id = record.get("chroma_doc_id") or uuid4().hex
+    new_title = (title or record["title"]).strip() or record["title"]
+
+    try:
+        chunk_count = rag.add_document(
+            chroma_doc_id, new_title, [(content, {})], source_type="typed"
+        )
+    except Exception as exc:
+        logger.exception("Failed to replace text for document %s", record["id"])
+        kb_store.update_document(
+            record["id"],
+            chunk_count=0,
+            status=kb_store.FAILED,
+            error=str(exc),
+            chroma_doc_id=chroma_doc_id,
+        )
+        raise HTTPException(
+            status_code=500, detail=f"Failed to index the new content: {exc}"
+        ) from exc
+
+    return {
+        "title": new_title,
+        "source_type": "typed",
+        "original_filename": None,
+        "chunk_count": chunk_count,
+        "status": kb_store.INDEXED,
+        "error": None,
+        "uploaded_by": uploaded_by,
+        "chroma_doc_id": chroma_doc_id,
+        "content_hash": digest,
+        "content": content,
+        "preview": content[:KB_PREVIEW_CHARS],
+    }
+
+
+
+@app.put("/kb/{doc_id}")
+async def replace_kb_document(doc_id: int, request: Request) -> dict[str, Any]:
+    """Replace a document's content (typed) or re-upload its file.
+
+    Accepts a JSON body ``{title?, content?}`` for typed documents or a
+    multipart form with a ``file`` part for file-based documents.
+    """
+    record = kb_store.get_document(doc_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail=f"Document {doc_id} not found")
+
+    content_type = request.headers.get("content-type", "")
+    title: str | None = None
+    content: str | None = None
+    file_bytes: bytes | None = None
+    filename: str | None = None
+    uploaded_by = record.get("uploaded_by") or "agent"
+
+    if content_type.startswith("multipart/form-data"):
+        form = await request.form()
+
+        title_value = form.get("title")
+        if isinstance(title_value, str) and title_value.strip():
+            title = title_value.strip()
+
+        uploaded_value = form.get("uploaded_by")
+        if isinstance(uploaded_value, str) and uploaded_value.strip():
+            uploaded_by = uploaded_value.strip()
+
+        upload = form.get("file")
+        if upload is not None and hasattr(upload, "read"):
+            filename = getattr(upload, "filename", None) or "upload"
+            file_bytes = await upload.read()
+    else:
+        try:
+            payload = await request.json()
+        except Exception as exc:
+            raise HTTPException(
+                status_code=400,
+                detail="Send a JSON body or multipart form data",
+            ) from exc
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=400, detail="Invalid request body")
+
+        title_value = payload.get("title")
+        if isinstance(title_value, str) and title_value.strip():
+            title = title_value.strip()
+
+        content_value = payload.get("content")
+        if isinstance(content_value, str):
+            content = content_value
+
+        uploaded_value = payload.get("uploaded_by")
+        if isinstance(uploaded_value, str) and uploaded_value.strip():
+            uploaded_by = uploaded_value.strip()
+
+    if file_bytes is not None:
+        if not file_bytes:
+            raise HTTPException(status_code=400, detail="The replacement file is empty")
+        if not filename:
+            raise HTTPException(status_code=400, detail="A filename is required")
+        fields = await run_in_threadpool(
+            _kb_reindex_file, record, file_bytes, filename, title, uploaded_by
+        )
+    elif content is not None:
+        new_content = content.strip()
+        if not new_content:
+            raise HTTPException(status_code=400, detail="Content must not be empty")
+        fields = await run_in_threadpool(
+            _kb_reindex_text, record, new_content, title, uploaded_by
+        )
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail="Provide replacement text or a replacement file",
+        )
+
+    updated = kb_store.update_document(doc_id, **fields)
+    if updated is None:  # pragma: no cover - row existed above
+        raise HTTPException(status_code=404, detail=f"Document {doc_id} not found")
+    return updated
+
+
+@app.delete("/kb/{doc_id}")
+def delete_kb_document(doc_id: int) -> dict[str, Any]:
+    """Delete a document record and all of its Chroma chunks."""
+    record = kb_store.get_document(doc_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail=f"Document {doc_id} not found")
+
+    try:
+        removed = rag.delete_document(
+            record.get("chroma_doc_id") or str(doc_id)
+        )
+    except Exception as exc:
+        logger.exception("Failed to delete chunks for document %s", doc_id)
+        raise HTTPException(
+            status_code=500, detail=f"Failed to delete document chunks: {exc}"
+        ) from exc
+
+    kb_store.delete_document(doc_id)
+    return {"id": doc_id, "deleted": True, "chunks_removed": removed}
+
+
+@app.post("/kb/search")
+def search_kb(payload: KbSearchIn) -> dict[str, Any]:
+    """Return the top matching chunks so users can test retrieval."""
+    query = payload.query.strip()
+    if not query:
+        raise HTTPException(status_code=400, detail="A query is required")
+
+    k = max(1, min(int(payload.k or 4), 20))
+    try:
+        results = rag.retrieve(query, k=k)
+    except Exception as exc:
+        logger.exception("Knowledge-base search failed")
+        raise HTTPException(
+            status_code=500, detail=f"Search failed: {exc}"
+        ) from exc
+
+    return {"query": query, "results": results}
+
 
 
 @app.get("/models")
