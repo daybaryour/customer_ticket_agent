@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
+import KnowledgeBase from './KnowledgeBase'
 import { API_BASE, errorMessage } from './api'
 
 const TABS = [
@@ -131,6 +132,7 @@ function TicketListItem({ ticket, selected, onSelect }) {
 
 
 function App() {
+  const [page, setPage] = useState('tickets')
   const [tickets, setTickets] = useState([])
   const [stats, setStats] = useState(null)
   const [tab, setTab] = useState('pending')
@@ -420,6 +422,27 @@ function App() {
           <p className="app-header__subtitle">Review AI replies and track each ticket to resolution</p>
         </div>
 
+        <nav className="app-nav" role="tablist" aria-label="Sections">
+          <button
+            type="button"
+            role="tab"
+            aria-selected={page === 'tickets'}
+            className={`tab${page === 'tickets' ? ' tab--active' : ''}`}
+            onClick={() => setPage('tickets')}
+          >
+            Tickets
+          </button>
+          <button
+            type="button"
+            role="tab"
+            aria-selected={page === 'kb'}
+            className={`tab${page === 'kb' ? ' tab--active' : ''}`}
+            onClick={() => setPage('kb')}
+          >
+            Knowledge base
+          </button>
+        </nav>
+
         <div className="model-selector">
           <span className="model-selector__label">Default model</span>
           {settingsLoading ? (
@@ -466,6 +489,8 @@ function App() {
         </form>
       </header>
 
+      {page === 'tickets' && (
+        <>
           <div className="banner-area">
             {notice && <div className="notice">{notice}</div>}
             {error && <div className="error">{error}</div>}
@@ -753,6 +778,10 @@ function App() {
           )}
         </section>
       </main>
+        </>
+      )}
+
+      {page === 'kb' && <KnowledgeBase />}
     </div>
   )
 }
